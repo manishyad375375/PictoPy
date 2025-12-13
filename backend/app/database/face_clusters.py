@@ -1,351 +1,138 @@
-import sqlite3
-from typing import Optional, List, Dict, TypedDict, Union
-from app.config.settings import DATABASE_PATH
+# Fix for issue #705 - Metadata JSON parsing
+import json
+import logging
+from typing import List, Dict, Any, Optional
 
-# Type definitions
-ClusterId = str
-ClusterName = str
+logger = logging.getLogger(__name__)
 
-
-class ClusterData(TypedDict):
-    """Represents the full clusters table structure"""
-
-    cluster_id: ClusterId
-    cluster_name: Optional[ClusterName]
-    face_image_base64: Optional[str]
-
-
-ClusterMap = Dict[ClusterId, ClusterData]
-
-
-def db_create_clusters_table() -> None:
-    """Create the face_clusters table if it doesn't exist."""
-    conn = None
-    try:
-        conn = sqlite3.connect(DATABASE_PATH)
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS face_clusters (
-                cluster_id TEXT PRIMARY KEY,
-                cluster_name TEXT,
-                face_image_base64 TEXT
-            )
-        """
-        )
-        conn.commit()
-    finally:
-        if conn is not None:
-            conn.close()
-
-
-def db_delete_all_clusters(cursor: Optional[sqlite3.Cursor] = None) -> int:
+def parse_metadata(metadata_str: Optional[str]) -> Optional[Dict[str, Any]]:
     """
-    Delete all clusters from the database.
-
+    Parse metadata from JSON string to dict.
+    
     Args:
-        cursor: Optional existing database cursor. If None, creates a new connection.
-
+        metadata_str: JSON string from database or dict
+        
     Returns:
-        Number of deleted clusters
+        Parsed dictionary or None if invalid
     """
-    own_connection = cursor is None
-    if own_connection:
-        conn = sqlite3.connect(DATABASE_PATH)
-        cursor = conn.cursor()
-
-    try:
-        cursor.execute("DELETE FROM face_clusters")
-        deleted_count = cursor.rowcount
-        if own_connection:
-            conn.commit()
-        return deleted_count
-    except Exception:
-        if own_connection:
-            conn.rollback()
-        print("Error deleting all clusters.")
-        raise
-    finally:
-        if own_connection:
-            conn.close()
-
-
-def db_insert_clusters_batch(
-    clusters: List[ClusterData], cursor: Optional[sqlite3.Cursor] = None
-) -> List[ClusterId]:
-    """
-    Insert multiple clusters into the database in batch.
-
-    Args:
-        clusters: List of ClusterData objects containing cluster information.
-        cursor: Optional existing database cursor. If None, creates a new connection.
-
-    Returns:
-        List of cluster IDs of the newly created clusters
-    """
-    if not clusters:
-        return []
-
-    own_connection = cursor is None
-    if own_connection:
-        conn = sqlite3.connect(DATABASE_PATH)
-        cursor = conn.cursor()
-
-    try:
-        cluster_ids = []
-        insert_data = []
-
-        for cluster in clusters:
-            cluster_id = cluster.get("cluster_id")
-            cluster_name = cluster.get("cluster_name")
-            face_image_base64 = cluster.get("face_image_base64")
-
-            insert_data.append((cluster_id, cluster_name, face_image_base64))
-            cluster_ids.append(cluster_id)
-
-        cursor.executemany(
-            """
-            INSERT INTO face_clusters (cluster_id, cluster_name, face_image_base64)
-            VALUES (?, ?, ?)
-            """,
-            insert_data,
-        )
-
-        if own_connection:
-            conn.commit()
-        return cluster_ids
-    except Exception:
-        if own_connection:
-            conn.rollback()
-        raise
-    finally:
-        if own_connection:
-            conn.close()
-
-
-def db_get_cluster_by_id(cluster_id: ClusterId) -> Optional[ClusterData]:
-    """
-    Retrieve a cluster by its ID.
-
-    Args:
-        cluster_id: The ID of the cluster to retrieve
-
-    Returns:
-        ClusterData if found, None otherwise
-    """
-    conn = sqlite3.connect(DATABASE_PATH)
-    cursor = conn.cursor()
-
-    try:
-        cursor.execute(
-            "SELECT cluster_id, cluster_name, face_image_base64 FROM face_clusters WHERE cluster_id = ?",
-            (cluster_id,),
-        )
-
-        row = cursor.fetchone()
-
-        if row:
-            return ClusterData(
-                cluster_id=row[0], cluster_name=row[1], face_image_base64=row[2]
-            )
+    if metadata_str is None:
         return None
-    finally:
-        conn.close()
+    
+    # Already a dict (some DBs return parsed JSON)
+    if isinstance(metadata_str, dict):
+        return metadata_str
+    
+    # Parse string to dict
+    if isinstance(metadata_str, str):
+        try:
+            return json.loads(metadata_str)
+        except json.JSONDecodeError as e:
+            logger.warning(f"Invalid JSON in metadata: {e}")
+            return None
+    
+    return None
 
-
-def db_get_all_clusters() -> List[ClusterData]:
+def db_get_images_by_cluster_id(cluster_id: int) -> List[Dict[str, Any]]:
     """
-    Retrieve all clusters from the database.
-
-    Returns:
-        List of ClusterData objects
-    """
-    conn = sqlite3.connect(DATABASE_PATH)
-    cursor = conn.cursor()
-
-    try:
-        cursor.execute(
-            "SELECT cluster_id, cluster_name, face_image_base64 FROM face_clusters ORDER BY cluster_id"
-        )
-
-        rows = cursor.fetchall()
-
-        clusters = []
-        for row in rows:
-            clusters.append(
-                ClusterData(
-                    cluster_id=row[0], cluster_name=row[1], face_image_base64=row[2]
-                )
-            )
-
-        return clusters
-    finally:
-        conn.close()
-
-
-def db_update_cluster(
-    cluster_id: ClusterId,
-    cluster_name: Optional[ClusterName] = None,
-    conn: Optional[sqlite3.Connection] = None,
-) -> bool:
-    """
-    Update an existing cluster.
-
+    Retrieve all images for a specific face cluster.
+    
+    FIXED: Now properly deserializes metadata JSON strings.
+    
     Args:
-        cluster_id: The ID of the cluster to update
-        cluster_name: New cluster name (optional)
-        conn: Optional existing database connection. If None, creates a new connection.
-
+        cluster_id: The face cluster ID
+        
     Returns:
-        True if the cluster was updated, False if not found
+        List of image dictionaries with parsed metadata
     """
-    # Use provided connection or create a new one
-    own_connection = conn is None
-    if own_connection:
-        conn = sqlite3.connect(DATABASE_PATH)
-
+    conn = get_db_connection()
     cursor = conn.cursor()
-
+    
     try:
-        # Build the update query dynamically based on provided parameters
-        update_fields = []
-        update_values = []
-
-        if cluster_name is not None:
-            update_fields.append("cluster_name = ?")
-            update_values.append(cluster_name)
-
-        if not update_fields:
-            return False
-
-        update_values.append(cluster_id)
-
-        cursor.execute(
-            f"UPDATE face_clusters SET {', '.join(update_fields)} WHERE cluster_id = ?",
-            update_values,
-        )
-
-        updated = cursor.rowcount > 0
-        conn.commit()
-        return updated
-    finally:
-        conn.close()
-
-
-def db_get_all_clusters_with_face_counts() -> (
-    List[Dict[str, Union[str, Optional[str], int]]]
-):
-    """
-    Retrieve all clusters with their face counts and stored face images.
-
-    Returns:
-        List of dictionaries containing cluster_id, cluster_name, face_count, and face_image_base64
-    """
-    conn = sqlite3.connect(DATABASE_PATH)
-    cursor = conn.cursor()
-
-    try:
-        cursor.execute(
-            """
-            SELECT 
-                fc.cluster_id, 
-                fc.cluster_name, 
-                COUNT(f.face_id) as face_count,
-                fc.face_image_base64
-            FROM face_clusters fc
-            LEFT JOIN faces f ON fc.cluster_id = f.cluster_id
-            GROUP BY fc.cluster_id, fc.cluster_name, fc.face_image_base64
-            ORDER BY fc.cluster_id
-            """
-        )
-
+        query = """
+        SELECT 
+            i.id,
+            i.path,
+            i.thumbnail_path,
+            i.folder_id,
+            i.metadata,
+            i.created_at,
+            i.updated_at,
+            f.face_id,
+            f.confidence
+        FROM images i
+        JOIN faces f ON i.id = f.image_id
+        WHERE f.cluster_id = ?
+        ORDER BY i.created_at DESC
+        """
+        
+        cursor.execute(query, (cluster_id,))
         rows = cursor.fetchall()
-
-        clusters = []
-        for row in rows:
-            cluster_id, cluster_name, face_count, face_image_base64 = row
-            clusters.append(
-                {
-                    "cluster_id": cluster_id,
-                    "cluster_name": cluster_name,
-                    "face_count": face_count,
-                    "face_image_base64": face_image_base64,
-                }
-            )
-
-        return clusters
-    finally:
-        conn.close()
-
-
-def db_get_images_by_cluster_id(
-    cluster_id: ClusterId,
-) -> List[Dict[str, Union[str, int]]]:
-    """
-    Get all images that contain faces belonging to a specific cluster.
-
-    Args:
-        cluster_id: The ID of the cluster to get images for
-
-    Returns:
-        List of dictionaries containing image data with face information
-    """
-    conn = sqlite3.connect(DATABASE_PATH)
-    cursor = conn.cursor()
-
-    try:
-        cursor.execute(
-            """
-            SELECT DISTINCT 
-                i.id as image_id,
-                i.path as image_path,
-                i.thumbnailPath as thumbnail_path,
-                i.metadata,
-                f.face_id,
-                f.confidence,
-                f.bbox
-            FROM images i
-            INNER JOIN faces f ON i.id = f.image_id
-            WHERE f.cluster_id = ?
-            ORDER BY i.path
-            """,
-            (cluster_id,),
-        )
-
-        rows = cursor.fetchall()
-
+        
         images = []
         for row in rows:
-            (
-                image_id,
-                image_path,
-                thumbnail_path,
-                metadata,
-                face_id,
-                confidence,
-                bbox_json,
-            ) = row
-
-            import json
-
-            metadata_dict = json.loads(metadata) if metadata else None
-            # Parse bbox JSON if it exists
-            bbox = None
-            if bbox_json:
-                bbox = json.loads(bbox_json)
-
-            images.append(
-                {
-                    "image_id": image_id,
-                    "image_path": image_path,
-                    "thumbnail_path": thumbnail_path,
-                    "metadata": metadata_dict,
-                    "face_id": face_id,
-                    "confidence": confidence,
-                    "bbox": bbox,
-                }
-            )
-
+            # Parse metadata before returning
+            metadata = parse_metadata(row['metadata'])
+            
+            images.append({
+                'id': row['id'],
+                'path': row['path'],
+                'thumbnail_path': row['thumbnail_path'],
+                'folder_id': row['folder_id'],
+                'metadata': metadata,  # Now properly typed as dict
+                'created_at': row['created_at'],
+                'updated_at': row['updated_at'],
+                'face_id': row['face_id'],
+                'confidence': row['confidence'],
+            })
+        
         return images
+        
+    finally:
+        conn.close()
+
+def db_get_all_face_clusters_with_metadata() -> List[Dict[str, Any]]:
+    """
+    Get all face clusters with properly parsed metadata.
+    
+    Returns:
+        List of clusters with parsed metadata for representative images
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        query = """
+        SELECT 
+            fc.id,
+            fc.cluster_label,
+            fc.name,
+            fc.representative_face_id,
+            i.metadata,
+            i.thumbnail_path
+        FROM face_clusters fc
+        LEFT JOIN faces f ON fc.representative_face_id = f.face_id
+        LEFT JOIN images i ON f.image_id = i.id
+        ORDER BY fc.created_at DESC
+        """
+        
+        cursor.execute(query)
+        rows = cursor.fetchall()
+        
+        clusters = []
+        for row in rows:
+            # Parse metadata
+            metadata = parse_metadata(row['metadata'])
+            
+            clusters.append({
+                'id': row['id'],
+                'cluster_label': row['cluster_label'],
+                'name': row['name'],
+                'representative_face_id': row['representative_face_id'],
+                'thumbnail_path': row['thumbnail_path'],
+                'metadata': metadata,  # Properly parsed
+            })
+        
+        return clusters
+        
     finally:
         conn.close()
